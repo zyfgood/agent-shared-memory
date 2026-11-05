@@ -19,7 +19,7 @@ hermes 精选漏斗 cron ──每天 06:30──▶ shared（从各私有 bank 
 zcode             ──自动每轮──▶ zcode（私有流水，retainBankId=zcode）
 zcode save_shared.py ──手动──▶ shared（agent:zcode）
 dsh hooks(未挂载)  ──自动每步──▶ dsh-<workspace>（私有流水，UserPromptSubmit/PostToolUse）
-dsh skill+AGENTS.md ──每会话──▶ 热记忆自动注入；dsh smem save ──手动按需──▶ shared（agent:dsh）
+dsh skill+AGENTS.md ──每会话──▶ 热记忆自动注入；dsh smem save ──手动──▶ dsh（私有结论库）──漏斗次日精选──▶ shared
 所有端 recall（hermes/zcode 自动、dsh 手动 hmem search）◀── shared（精选层）
 ```
 
@@ -35,17 +35,22 @@ dsh skill+AGENTS.md ──每会话──▶ 热记忆自动注入；dsh smem sa
 | zcode | hooks 已装（SessionStart/UserPromptSubmit/Stop）；autoRetain → 私有 `zcode` bank；recall 自动读 shared；`save_shared.py` 手动写 shared（`agent:zcode`） |
 | dsh | 私有流水：hooks（`hooks-claude-code`，每步用户输入 + 每次工具调用自动 retain → `dsh-<workspace>`）；共享：`hmem`（`~/.local/bin/hmem` → 本目录 `bin/hmem.sh`），手动按需读写 shared（`agent:dsh`） |
 
-## DSH 侧（2026-11-05）：skill + 热记忆两层
+## DSH 侧（2026-11-05）：热记忆 + 私有库 + 精选共享（B 方案）
 
-DSH 没有 hermes 那样的自动记忆 provider，所以用两个互补的层：
+DSH 没有 hermes 那样的自动记忆 provider，所以用三层：
 
 | 层 | 位置 | 生效方式 | 放什么 |
 |---|---|---|---|
 | **热记忆（SOUL.md 等价物）** | `~/.dsh/AGENTS.md` 的 `## HOT MEMORY` 区块 | `dsh-agent-instructions` 每次会话自动注入上下文（默认开启，链预算 `maxBytes: 65536`；用户全局 `~/.dsh/AGENTS.md` + 项目 `AGENTS.md`/`CLAUDE.md` 链） | ≤25 行"现在仍然有效、每次都需要"的事实与铁律 |
-| **语义记忆** | Hindsight `shared` bank | 按需 `search`（语义 + 图谱） | 结论级记忆：决策、根因、环境事实、偏好、可复用步骤 |
+| **私有结论库 `dsh`** | Hindsight bank **`dsh`**（2026-11-05 新建并实测） | DSH 手动写入，即时落库、不裁剪 | 本端结论：决策、根因、环境事实、偏好 |
+| **精选共享库 `shared`** | Hindsight `shared` bank | 每天 06:30 漏斗从各私有库 LLM 精选 ≤10 条/库进 shared（新 bank 自动被发现） | 值得跨端共享的结论级内容 |
 
 - skill：`~/.dsh/skills/shared-memory/`（`SKILL.md` + `scripts/smem.py` + `scripts/session_recall.py` + `references/upgrade-auto-recall.md`）
-- CLI：`python ~/.dsh/skills/shared-memory/scripts/smem.py {ping|search|save|reflect|stats|recent}`（纯标准库，直连 mesh 地址；默认 tag `agent:dsh`，可用 `SMEM_AGENT` 覆盖）
+- CLI：`python ~/.dsh/skills/shared-memory/scripts/smem.py {ping|search|both|save|reflect|recent|stats}`（纯标准库，直连 mesh 地址；默认 tag `agent:dsh`）
+  - `save "结论"` → **默认写私有库 `dsh`**（`SMEM_PRIVATE`）；`--to shared` 才直写共享库
+  - `both "关键词"` → shared + dsh 合并去重（会话开始用这个）；`--bank hermes-default` 可查其他端私有流水
+- 漏斗吞吐与容量：每库每次 ≤10 条，未入选条目被标记已同步不再重评；`shared` 护栏 650 条（当前 645），超限按 LLM 分数裁剪，先裁 `curated` 自动批次。shared 因此是"近期有效结论"的滚动层，长期保靠 `dsh`；放宽容量改 `hindsight_shared_funnel.py` 的 `SHARED_CAP`。
+- 实测闭环：`save` → 异步抽取（20~30s）→ `both` 命中 ✅（2026-11-05）
 - 约定：会话开始查一次记忆；有结论时写一条自包含的结论（含日期与原因）；若该结论"每次会话都需要"，同时写进 HOT MEMORY。
 - 实测：save → 异步抽取 → search 命中闭环已验证（2026-11-05）。
 - 想让 recall 真正**自动注入**（而不是靠 agent 自觉），用 `dsh-hooks-claude-code` 桥接 + `session_recall.py`，步骤见 skill 的 `references/upgrade-auto-recall.md`（需装插件并重启 DSH，本目录 `hooks/` 就是同一思路的旧实现）。
