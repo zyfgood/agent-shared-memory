@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# hmem.sh — dsh 侧 Hindsight 共享记忆 CLI（0 安装版，仅依赖 curl + python3）
+#
+# 用法:
+#   hmem bank                                # 显示当前服务与 bank
+#   hmem save   "内容" [tag...]              # 写入（默认 tag: agent:dsh；retain 异步约 20~30s 后可查）
+#   hmem search "查询" [tag...]              # 语义检索
+#   hmem reflect "问题"                      # LLM 综合回答
+#   hmem stats                               # 库统计（完整 JSON，可管道解析）
+#
+# 环境变量:
+#   HMEM_BASE   hindsight API 基址（默认 http://127.0.0.1:9177/v1/default/banks/shared）
+#   HMEM_BANK   bank 名（默认 shared，仅用于 bank 命令显示）
+#   HMEM_TYPES  检索事实类型（默认 observation,world,experience）
+#
+# 退出码: 0 成功 / 1 用法错误 / 2 网络或连接失败 / 3 服务端错误
+set -euo pipefail
+
+BASE="${HMEM_BASE:-http://127.0.0.1:9177/v1/default/banks/shared}"
+BANK="${HMEM_BANK:-shared}"
+TYPES="${HMEM_TYPES:-observation,world,experience}"
+
+die() { echo "❌ $*" >&2; exit 2; }
+
+# 统一请求封装：成功时把响应 JSON 打到 stdout；失败时打印可读错误并退出。
+# 注意：本函数可能在命令替换/管道子 shell 中执行，die 的退出码经 pipefail/赋值传播。
+req() {
+  local method="$1" url="$2" body="${3:-}"
+  local tmp status
+  tmp=$(mktemp)
+  local curl_args=(-s -o "$tmp" -w '%{http_code}' --noproxy '*' --connect-timeout 5 -m 30 \
+    -X "$method" "$url" -H 'Content-Type: application/json')
+  if [ -n "$body" ]; then curl_args+=(-d "$body"); fi
+  if ! status=$(curl "${curl_args[@]}"); then
+    rm -f "$tmp"
+    die "无法连接 hindsight 服务（$url）。服务是否在运行？health: $(curl -s -m 3 http://127.0.0.1:9177/health 2>/dev/null || echo 不可达)"
+  fi
+  if [ "$status" != "200" ] && [ "$status" != "201" ] && [ "$status" != "202" ]; then
+    local detail
+    detail=$(python3 -c "
+import sys,json
+try:
+    d=json.load(open('$tmp')); print(d.get('detail') or json.dumps(d,ensure_ascii=False)[:300])
+except Exception:
+    print(open('$tmp',encoding='utf-8',errors='replace').read()[:300])" 2>/dev/null || true)
+    rm -f "$tmp"
+    echo "❌ hindsight 返回 HTTP $status：$detail" >&2
+    exit 3
+  fi
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+cmd_bank() { echo "hindsight 服务: $BASE"; echo "bank: $BANK（事实数见 hmem stats）"; }
+
+cmd_save() {
+  [ $# -ge 1 ] || { echo "用法: hmem save \"内容\" [tag...]" >&2; exit 1; }
+  local content="$1"; shift || true
+  local body tags out
+  tags=$(python3 -c "
+import json,sys
+print(json.dumps(['agent:dsh']+sys.argv[1:]))" "$@")
+  body=$(python3 -c "
+import json,sys
+print(json.dumps({'items':[{'content':sys.argv[1],'tags':json.loads(sys.argv[2])}],'async':True}))" "$content" "$tags")
+  out=$(req POST "$BASE/memories" "$body")   # req 失败会 die 退出
+  printf '%s\n' "$out" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('✅ retain', 'OK' if d.get('success') else d, '| items='+str(d.get('items_count')), '| op='+str(d.get('operation_id'))[:8])"
+  echo "（异步管线约 20~30s 后可检索到）"
+}
+
+cmd_search() {
+  [ $# -ge 1 ] || { echo "用法: hmem search \"查询\" [tag...]" >&2; exit 1; }
+  local q="$1"; shift || true
+  local body taglist='null' out
+  [ $# -gt 0 ] && taglist=$(python3 -c "import sys,json;print(json.dumps(sys.argv[1:]))" "$@")
+  body=$(python3 -c "
+import json,sys
+print(json.dumps({'query':sys.argv[1],'budget':'mid','types':sys.argv[2].split(','),'tags':json.loads(sys.argv[3])}))" "$q" "$TYPES" "$taglist")
+  out=$(req POST "$BASE/memories/recall" "$body")
+  printf '%s\n' "$out" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+rs=d.get('results') or d.get('memories') or []
+if not rs:
+    print('（无结果）')
+for x in rs:
+    print('-', (x.get('text') or '')[:300])
+    print('  tags:', ','.join(x.get('tags') or []), '| type:', x.get('type'))
+print('count=',len(rs))"
+}
+
+cmd_reflect() {
+  [ $# -ge 1 ] || { echo "用法: hmem reflect \"问题\"" >&2; exit 1; }
+  local body out
+  body=$(python3 -c "import json,sys;print(json.dumps({'query':sys.argv[1],'budget':'low'}))" "$1")
+  out=$(req POST "$BASE/reflect" "$body")
+  printf '%s\n' "$out" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get('answer') or d.get('response') or json.dumps(d,ensure_ascii=False)[:800])
+except Exception:
+    print(sys.stdin.read()[:500])"
+}
+
+cmd_stats() {
+  local out
+  out=$(req GET "$BASE/stats")
+  printf '%s\n' "$out" | python3 -m json.tool --no-ensure-ascii
+}
+
+case "${1:-}" in
+  bank)    shift; cmd_bank "$@" ;;
+  save)    shift; cmd_save "$@" ;;
+  search)  shift; cmd_search "$@" ;;
+  reflect) shift; cmd_reflect "$@" ;;
+  stats)   shift; cmd_stats "$@" ;;
+  *) echo "用法: hmem {bank|save|search|reflect|stats} ..." >&2; exit 1 ;;
+esac

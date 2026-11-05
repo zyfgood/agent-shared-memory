@@ -1,0 +1,24 @@
+{
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "C:/Users/风雨同行/AppData/Local/Programs/Python/Python312/python.exe D:/DSHProjects/agent-shared-memory/hooks/retain.py prompt || python3 /mnt/d/DSHProjects/agent-shared-memory/hooks/retain.py prompt",
+          "timeout": 20
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "C:/Users/风雨同行/AppData/Local/Programs/Python/Python312/python.exe D:/DSHProjects/agent-shared-memory/hooks/retain.py tool || python3 /mnt/d/DSHProjects/agent-shared-memory/hooks/retain.py tool",
+          "timeout": 20
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""dsh → Hindsight 私有 bank 活动流 retain（方案 1a）。
+
+由 @deepseek-ai/dsh-hooks-claude-code 触发，stdin 收 CC 风格 hook payload：
+  argv[1]=prompt → UserPromptSubmit：记录每步新内容（用户输入等）
+  argv[1]=tool   → PostToolUse：记录每次工具调用（名称/入参/结果）
+
+写入私有 bank：bank_id = dsh-<workspace-slug>（可由 DSH_PRIVATE_BANK 覆盖）。
+shared bank 与既有 hmem 手动流程完全不动。
+
+安全约定（不影响 agent 循环，与 dsh-hook-protocol 解析对齐）：
+  * 退出码恒为 0、stdout 恒为空 → 不产生 block/deny/additionalContext
+  * 错误只写 stderr（被 dsh 记录，非阻塞）；失败静默降级，绝不让 hook 拖慢会话
+  * 所有请求短超时；retain 走服务端 async 抽取管线（~20~30s 后可检索）
+
+环境变量：
+  DSH_HMEM_BASE     API 基址（默认 http://127.0.0.1:9177/v1/default/banks）
+  DSH_PRIVATE_BANK  固定 bank 覆盖（默认按 cwd 生成 dsh-<slug>）
+  DSH_HMEM_TIMEOUT  单请求超时秒数（默认 15）
+  DSH_HMEM_DEBUG=1  打开 stderr 日志
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get('DSH_HMEM_BASE', 'http://127.0.0.1:9177/v1/default/banks')
+TIMEOUT = float(os.environ.get('DSH_HMEM_TIMEOUT', '15'))
+DEBUG = os.environ.get('DSH_HMEM_DEBUG') == '1'
+STATE_DIR = os.path.expanduser('~/.dsh/hindsight')
+BANK_CACHE = os.path.join(STATE_DIR, 'known-banks.json')
+
+MAX_INPUT = 1200    # 工具入参截断
+MAX_RESULT = 2500   # 工具结果截断
+MAX_PROMPT = 3000   # 用户输入截断
+MAX_CONTENT = 4000  # 单条 content 总截断
+MAX_TAG = 40
+
+
+def log(msg: str) -> None:
+    if DEBUG:
+        sys.stderr.write(f'[dsh-hooks/retain] {msg}\n')
+
+
+def clip(text, limit: int) -> str:
+    text = (text or '').strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + '…[截断]'
+
+
+def slug_of(cwd: str) -> str:
+    s = re.sub(r'[^a-z0-9]+', '-', cwd.lower()).strip('-')
+    return (s or 'default')[:40]
+
+
+def http(method: str, url: str, body=None):
+    """直连本地服务：绕开环境代理，短超时。返回 (status, raw_bytes)；异常 status=0。"""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={'Content-Type': 'application/json'})
+    try:
+        with opener.open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read(2000)
+            log(f'{method} {url} -> {resp.status}')
+            return resp.status, raw
+    except urllib.error.HTTPError as e:
+        log(f'{method} {url} -> HTTP {e.code}: {e.read(500)!r}')
+        return e.code, b''
+    except Exception as e:  # 网络/超时等：静默降级
+        log(f'{method} {url} -> {e!r}')
+        return 0, b''
+
+
+def ensure_bank(bank: str) -> None:
+    """幂等确保 bank 存在（本地缓存避免每次 PUT）。"""
+    try:
+        with open(BANK_CACHE) as fh:
+            known = json.load(fh)
+    except Exception:
+        known = []
+    if bank in known:
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    status, _ = http('PUT', f'{BASE}/{bank}', {})
+    if status and 200 <= status < 300:
+        try:
+            known.append(bank)
+            with open(BANK_CACHE, 'w') as fh:
+                json.dump(known, fh)
+        except Exception as e:
+            log(f'cache write failed: {e!r}')
+    else:
+        log(f'bank PUT status={status}（不存在或已存在都继续尝试 retain）')
+
+
+def retain(bank: str, content: str, tags) -> None:
+    if not content:
+        return
+    body = {'items': [{'content': content, 'tags': list(tags), 'type': 'observation'}],
+            'async': True}
+    status, _ = http('POST', f'{BASE}/{bank}/memories', body)
+    log(f'retain -> {status} | content={len(content)}B | tags={tags}')
+
+
+def build(kind: str, p: dict):
+    cwd = p.get('cwd') or os.getcwd()
+    ws = slug_of(cwd)
+    bank = os.environ.get('DSH_PRIVATE_BANK') or ('dsh-' + ws)
+    sid = p.get('session_id') or ''
+    tags = ['agent:dsh', 'ws:' + ws]
+    if sid:
+        tags.append('sid:' + sid[:8])
+
+    if kind == 'prompt':
+        text = clip(p.get('prompt'), MAX_PROMPT)
+        if not text:
+            return None
+        return bank, '用户输入：' + text, tags + ['kind:user-prompt']
+
+    if kind == 'tool':
+        name = (p.get('tool_name') or '').strip()
+        if not name:
+            return None
+        parts = [f'工具调用：{name}']
+        ti = p.get('tool_input')
+        if ti is not None and str(ti).strip():
+            parts.append('入参：' + clip(json.dumps(ti, ensure_ascii=False), MAX_INPUT))
+        tr = p.get('tool_response') or ''
+        if tr.strip():
+            parts.append('结果：' + clip(tr, MAX_RESULT))
+        return bank, clip('\n'.join(parts), MAX_CONTENT), tags + ['kind:tool-use', 'tool:' + clip(name, MAX_TAG)]
+
+    return None
+
+
+def main() -> None:
+    kind = sys.argv[1] if len(sys.argv) > 1 else 'tool'
+    try:
+        p = json.load(sys.stdin)
+    except Exception as e:
+        log(f'payload parse failed: {e!r}')
+        return
+    if not isinstance(p, dict):
+        return
+    try:
+        item = build(kind, p)
+    except Exception as e:
+        log(f'build failed: {e!r}')
+        return
+    if item is None:
+        return
+    bank, content, tags = item
+    ensure_bank(bank)
+    retain(bank, content, tags)
+
+
+if __name__ == '__main__':
+    main()

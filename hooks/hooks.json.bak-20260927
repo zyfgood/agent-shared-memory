@@ -1,0 +1,24 @@
+{
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 /mnt/d/DSHProjects/agent-shared-memory/hooks/retain.py prompt",
+          "timeout": 20
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 /mnt/d/DSHProjects/agent-shared-memory/hooks/retain.py tool",
+          "timeout": 20
+        }
+      ]
+    }
+  ]
+}
